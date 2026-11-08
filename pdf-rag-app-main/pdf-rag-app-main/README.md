@@ -1,139 +1,236 @@
-# PDF Question Answering with RAG
+# PDF Agreement Explainer — Multi-Document RAG
 
-A complete Streamlit application that answers questions from uploaded PDFs using
-page-aware retrieval-augmented generation (RAG). It extracts embedded text with
-PyMuPDF, creates local Sentence Transformers embeddings, stores vectors in a
-session-scoped ChromaDB collection, retrieves relevant passages, and asks
-DeepSeek to answer strictly from those passages.
+A Python application that lets users upload multiple PDFs, search their contents semantically, and ask questions answered from retrieved document passages with page-level citations.
+
+**Author:** Madhav Kumar
+
+## Overview
+
+Reading and comparing long PDF documents can be time-consuming, especially when relevant information is spread across several files. This application combines PDF text extraction, local text embeddings, vector search and a language model to help users find relevant passages and ask evidence-grounded questions.
+
+Although the project can be used with agreements, the implementation is a general-purpose multi-document PDF search and question-answering application. It does not currently include agreement-specific clause extraction or legal advice functionality.
 
 ## Features
 
-- **Multi-File Search**: Direct vector & semantic search across multiple files simultaneously with similarity scores, keyword highlighting, and per-document result breakdowns.
-- **Cross-Document Question Answering**: Synthesizes information across multiple uploaded documents with balanced retrieval, conflict detection, and exact page citations `[filename.pdf, p. N]`.
-- **Flexible Scope Filtering**: Seamlessly toggle between querying all uploaded files or focusing on specific documents for targeted comparison.
-- **Batch Multi-PDF Ingestion**: Upload and index multiple PDFs in one operation with extension, signature, size, corruption, encryption, and empty-file validation.
-- **Detection of Image-Only/Scanned PDFs**: Automatically identifies PDFs needing OCR and provides actionable feedback without crashing.
-- **One-Based Page Metadata**: Chunks never cross page boundaries, guaranteeing unambiguous page-level citations.
-- **Local `all-MiniLM-L6-v2` Embeddings**: Computes normalized vectors locally with cosine distance in ChromaDB.
-- **Deterministic Insufficient-Evidence Fallback**: Immediate fallback response without unnecessary API calls when relevant evidence is lacking.
-- **In-Memory Session Vector Store**: Complete session isolation with ephemeral in-memory Chroma storage.
-- **Document Explorer & Transparency**: Inspect extracted chunks and verify page boundaries directly from the UI.
-- **DeepSeek API Generation**: High-quality answers strictly grounded in retrieved evidence.
-- **Comprehensive Unit Tests**: Fully mocked test suite using generated PDFs and deterministic test doubles.
+- **Multi-PDF upload:** Upload and index multiple text-based PDF files in one session.
+- **PDF validation:** Check file extension, PDF signature, file size, corruption, encryption and empty documents.
+- **Scanned-PDF detection:** Identify PDFs that do not contain enough embedded text and provide feedback when OCR is needed.
+- **Page-aware extraction:** Extract text page by page and retain one-based page numbers.
+- **Overlapping chunking:** Split page text into overlapping chunks without crossing page boundaries.
+- **Local embeddings:** Generate normalized text embeddings with Sentence Transformers using `all-MiniLM-L6-v2` by default.
+- **Vector search:** Store and retrieve document chunks with ChromaDB using cosine distance.
+- **Cross-document retrieval:** Balance retrieved passages across matching documents to reduce the chance that one document dominates the context.
+- **Scope filtering:** Search all indexed documents or restrict retrieval to selected files.
+- **Grounded question answering:** Send retrieved evidence to the DeepSeek chat API with instructions to avoid unsupported answers and cite factual claims.
+- **Page-level citations:** Display source filenames and page numbers alongside retrieved evidence.
+- **Insufficient-evidence fallback:** Return a fixed response when retrieval does not find sufficiently relevant evidence, without calling the language model.
+- **Document explorer:** Inspect indexed document metadata and extracted chunks.
+- **Session isolation:** Keep document vectors in an ephemeral, session-scoped ChromaDB collection.
+
+## Technology Stack
+
+| Area | Technologies |
+|---|---|
+| Language | Python |
+| User interface | Streamlit |
+| PDF processing | PyMuPDF |
+| Embeddings | Sentence Transformers |
+| Vector database | ChromaDB |
+| LLM integration | OpenAI Python SDK configured for the DeepSeek API |
+| Configuration | python-dotenv |
+| Testing | pytest |
 
 ## Architecture
 
+The application is separated into three primary modules:
+
 ```text
-PDF upload
-   │
-   ▼
-ingest.py ── validate ── extract per page ── overlapping page-local chunks
-   │
-   ▼
-Sentence Transformer ── normalized embeddings
-   │
-   ▼
-Session-only ChromaDB collection (cosine distance)
-   │
-   ├── delete by document_id
-   │
-Question ── embed ── retrieve top matching chunks ── similarity cutoff
-                                                 │
-                              insufficient ──────┴─── sufficient
-                                  │                       │
-                                  ▼                       ▼
-                          fixed fallback              DeepSeek
-                                                         │
-                                                         ▼
-                                            grounded answer + citations
+                 Streamlit UI (app.py)
+                         |
+             Upload PDFs / Ask questions
+                         |
+              PDF ingestion (ingest.py)
+              |  Validate file
+              |  Extract text by page
+              |  Create overlapping chunks
+                         |
+              Sentence Transformers
+                 Local embeddings
+                         |
+              ChromaDB session store
+                         |
+          Semantic retrieval and filtering
+                         |
+             Evidence threshold check
+                    /        \
+             Not enough     Sufficient
+              evidence      evidence
+                 |              |
+          Fixed fallback    DeepSeek API
+                                 |
+                       Answer with citations
 ```
 
-`app.py` owns the Streamlit UI and per-session state. `ingest.py` is responsible
-for all untrusted-file handling and page-aware chunks. `rag.py` owns vector
-storage, retrieval, evidence formatting, and DeepSeek generation. Chunks never
-cross page boundaries, so every citation maps to exactly one PDF page.
+### Module responsibilities
 
-The Chroma client is ephemeral by design. Closing/expiring a Streamlit session
-removes its vectors; no uploaded PDF bytes are written to disk. The cached
-Sentence Transformer model is shared safely because it contains model weights,
-not user documents.
+- **`app.py`:** Implements the Streamlit interface, session state, PDF upload and document management, chat history, multi-file search and document exploration.
+- **`ingest.py`:** Validates uploaded PDFs, extracts page text, detects likely scanned documents and creates page-aware overlapping chunks.
+- **`rag.py`:** Generates embeddings, manages the ChromaDB collection, retrieves relevant chunks, formats evidence and calls the DeepSeek-compatible chat API.
 
-## Prerequisites
+## PDF Ingestion and Chunking
 
-- Python 3.10, 3.11, or 3.12
-- Internet access on first launch to download the Sentence Transformers model
+Each uploaded file is validated before processing. The ingestion module checks the filename, PDF signature, upload size and whether the file can be opened. Password-protected and empty PDFs are rejected. Files with insufficient embedded text are identified as likely scanned PDFs; OCR is not performed by the application.
+
+Text is extracted separately from every page. The chunking process uses a default chunk size of 1,200 characters and an overlap of 200 characters. Chunks retain the source filename, page number, document identifier and chunk index. Keeping chunks within individual pages ensures that a retrieved passage can be traced to a specific PDF page.
+
+A SHA-256 hash of the uploaded PDF bytes is used as its document identifier.
+
+## Retrieval and Question Answering
+
+1. The embedding model converts each document chunk into a normalized vector.
+2. ChromaDB stores vectors and metadata in a session-specific collection configured for cosine distance.
+3. A user query is embedded using the same model.
+4. The retriever obtains candidate passages and applies a distance threshold (default maximum distance: 0.75 for question answering).
+5. For multi-document queries, the retriever first selects a strong candidate from each represented document, then fills remaining result slots by relevance.
+6. If no passage satisfies the threshold, the application returns:
+
+   `I don't have enough evidence in the uploaded PDFs to answer that.`
+
+7. If relevant evidence exists, the application sends the question and retrieved passages to the DeepSeek API. The prompt instructs the model to answer only from the supplied evidence, report conflicting source information and cite factual claims using the source filename and page number.
+
+The Search Across Files interface also supports direct semantic retrieval without calling the language model. Users can adjust the result limit, similarity threshold and document scope.
+
+## Session and Data Handling
+
+The application creates a unique session identifier and uses it when creating the ChromaDB collection. The vector store is ephemeral and scoped to the Streamlit session. Uploaded PDF bytes are processed in memory by the ingestion code and are not intentionally written to a project data directory.
+
+The Sentence Transformers model is cached by Streamlit as a shared model resource; uploaded document content and vectors are maintained separately in session state and the session-scoped vector store.
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.10, 3.11 or 3.12
+- pip
+- Internet access on first launch to download the embedding model and to call the configured language-model API
 - A DeepSeek API key
 
-## Setup and run
-
-### Windows PowerShell
-
-```powershell
-cd C:\Users\TSI\Documents\Codex\2026-10-20\exp\outputs\pdf-rag-app
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-Copy-Item .env.example .env
-# Set your DEEPSEEK_API_KEY in .env
-python -m streamlit run app.py
-```
-
-### macOS or Linux
+### 1. Clone the repository
 
 ```bash
-cd /path/to/pdf-rag-app
+git clone https://github.com/yomadhavvvv/PDF-Agreement-Explainer.git
+cd PDF-Agreement-Explainer/pdf-rag-app-main/pdf-rag-app-main
+```
+
+### 2. Create a virtual environment
+
+**Windows PowerShell**
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+**macOS / Linux**
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
+```
+
+### 3. Install dependencies
+
+```bash
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-cp .env.example .env
-# Set your DEEPSEEK_API_KEY in .env
+```
+
+### 4. Configure environment variables
+
+Create a file named `.env` in the same directory as `app.py`:
+
+```env
+DEEPSEEK_API_KEY=your_api_key
+DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+EMBEDDING_MODEL=all-MiniLM-L6-v2
+```
+
+Only `DEEPSEEK_API_KEY` is required. The other variables have defaults in the application. Replace the placeholder with your own key. Never commit the `.env` file or expose API credentials in source code.
+
+### 5. Run the application
+
+```bash
 python -m streamlit run app.py
 ```
 
-Open the local URL printed by Streamlit (normally `http://localhost:8501`).
-Upload one or more text-based PDFs, select **Process selected PDFs**, and use the
-chat box. For scanned PDFs, run OCR in a PDF tool first and upload the resulting
-searchable PDF.
+Streamlit prints a local address in the terminal. Open it in a browser to use the application.
 
-## Run tests
+## Using the Application
 
-With the virtual environment activated:
+1. Upload one or more text-based PDF documents from the sidebar.
+2. Select **Process Selected PDFs** to validate, extract, chunk and index them.
+3. Use **Multi-File Question Answering** to ask a question across the selected documents.
+4. Use **Search Across Files** to find semantically relevant passages without generating an LLM response.
+5. Use the document overview to inspect page counts, chunk counts and extracted text.
+6. Remove individual documents or clear the session's indexed documents when finished.
 
-```powershell
+Each uploaded file is limited to 25 MB by the ingestion module.
+
+## Tests
+
+The repository includes pytest tests for the ingestion and retrieval modules. The tests use generated PDF files and a deterministic fake embedding model so that core behaviors can be tested without downloading the Sentence Transformers model or making live language-model API calls.
+
+The tests cover:
+
+- PDF filename, signature and empty-file validation.
+- Detection of scanned/image-only PDFs.
+- Page number preservation and page-local chunking.
+- Chunk overlap and parameter validation.
+- Multiple PDF ingestion with partial failures.
+- Adding, retrieving and deleting document vectors.
+- Similarity-distance filtering and document-specific retrieval.
+- Balanced retrieval across multiple documents.
+- Insufficient-evidence handling.
+- DeepSeek request construction using a fake client.
+- Recovery from a problematic Chroma ephemeral-client cache state.
+
+Run the tests from the project directory:
+
+```bash
 python -m pytest -q
 ```
 
-The tests do not require an active API key or network access, and do not
-download a Sentence Transformers model. They use generated PDFs and test doubles.
+The test suite does not require a real DeepSeek API key. It does require the Python dependencies in `requirements.txt`.
 
 ## Configuration
 
 | Variable | Required | Default | Purpose |
-|---|---:|---|---|
-| `DEEPSEEK_API_KEY` | Yes | none | DeepSeek API key |
-| `DEEPSEEK_MODEL` | No | `deepseek-v4-flash` | DeepSeek model name (`deepseek-v4-flash`, etc.) |
-| `DEEPSEEK_BASE_URL` | No | `https://api.deepseek.com` | DeepSeek API base URL |
-| `EMBEDDING_MODEL` | No | `all-MiniLM-L6-v2` | Sentence Transformers embedding model |
+|---|---|---|---|
+| `DEEPSEEK_API_KEY` | Yes for generated answers | None | API credential for the DeepSeek-compatible chat endpoint |
+| `DEEPSEEK_MODEL` | No | `deepseek-v4-flash` | Chat model name |
+| `DEEPSEEK_BASE_URL` | No | `https://api.deepseek.com` | API base URL |
+| `EMBEDDING_MODEL` | No | `all-MiniLM-L6-v2` | Sentence Transformers model used for embeddings |
 
-Do not put secrets in source code or commit `.env`. In production, inject the
-variables with the hosting platform's secret manager (such as Streamlit Community Cloud Secrets).
+## Limitations
 
-## Multi-File Search and Grounding Behavior
+- Scanned PDFs are detected but not processed with OCR. Users must provide searchable PDFs.
+- PDF extraction quality depends on the embedded text and document layout.
+- Chunking is character-based and page-aware; it is not agreement-specific or structurally aware of legal clauses.
+- The vector store is ephemeral, so indexed vectors are not intended to persist across sessions.
+- Generated answers depend on retrieved evidence and the external language-model API. Citations help trace evidence but do not guarantee that an answer is legally correct.
+- This application is a document exploration tool, not a substitute for professional legal advice.
+- A DeepSeek API key and network access are needed for generated answers; direct vector search and document exploration do not require a generation call.
 
-### Multi-File Search
-The **Search Across Files** tab provides direct vector search across all indexed PDFs (or a filtered selection). Users can adjust the minimum similarity threshold and maximum results. Matches are displayed with:
-- Filename and exact page number
-- Similarity percentage match
-- Excerpt preview with query term highlighting
-- Quick action button to ask a grounded question about that specific excerpt in the Q&A tab
+## Future Improvements
 
-### Multi-File Retrieval and Answering
-When answering questions across multiple documents:
-1. **Scope Selection**: Users can query across all indexed documents or select specific files from the scope filter.
-2. **Balanced Retrieval**: To avoid a single document monopolizing all retrieved passages, the retriever queries a candidate pool and balances representation across all relevant documents before ordering chunks by similarity.
-3. **Thresholding**: Cosine distance cutoff of `0.75` filters out irrelevant noise. If no chunk meets this threshold, the deterministic message is returned immediately without calling the API:
-   `I don't have enough evidence in the uploaded PDFs to answer that.`
-4. **Cross-Document Synthesis**: If sufficient evidence exists, DeepSeek is prompted to synthesize findings across the files, explicitly compare or contrast source documents when appropriate, report conflicts, and provide exact citations `[filename.pdf, p. N]` for every factual claim.
+- Add OCR support for scanned PDFs.
+- Evaluate retrieval quality using a question-to-source-page test set.
+- Experiment with structure-aware chunking and optional reranking.
+- Add stronger citation validation and answer-quality checks.
+- Add tests for adversarial instructions embedded in uploaded documents.
+- Provide optional persistence with explicit document retention and deletion controls.
 
+## Author
+
+**Madhav Kumar**
